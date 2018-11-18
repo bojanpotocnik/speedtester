@@ -1,0 +1,11 @@
+# PyCharm
+.idea/
+!.idea/vcs.xml
+!.idea/inspectionProfiles/
+!.idea/modules.xml
+
+# Working cache
+cache/
+
+# Output
+results.csv
