@@ -1,8 +1,10 @@
+import datetime
 import itertools
+import sys
 import time
-import warnings
 from collections import defaultdict
-from typing import List, Optional, Sequence, Dict, Tuple, Any
+from dataclasses import dataclass, field
+from typing import List, Optional, Sequence, Dict, Tuple, Any, Union
 from xml.etree import ElementTree
 
 import speedtest
@@ -10,51 +12,38 @@ import speedtest
 __author__ = "Bojan Potočnik"
 
 
+@dataclass(frozen=True)
 class SpeedtestServer:
-    def __init__(self, xml_server_node: ElementTree.Element):
-        self.attrib = xml_server_node.attrib
+    id: int
+    name: str
+    url: str
+    host: str
+    country: str
+    country_code: str
+    sponsor: str
+    latitude: float
+    longitude: float
+    xml_attrib: Dict[str, Union[str, float]] = field(repr=False)
 
-    def __str__(self) -> str:
-        return "{}({})".format(type(self).__name__, self.attrib)
+    @classmethod
+    def from_xml(cls, xml_server_node: ElementTree.Element) -> 'SpeedtestServer':
+        atr = xml_server_node.attrib
 
-    def __repr__(self) -> str:
-        return "<{} at 0x{:08x}".format(str(self), id(self))
+        return SpeedtestServer(
+            xml_attrib=atr,
+            id=int(atr["id"]),
+            name=atr["name"],
+            url=atr["url"],
+            host=atr["host"],
+            country=atr["country"],
+            country_code=atr["cc"],
+            sponsor=atr["sponsor"],
+            latitude=float(atr["lat"]),
+            longitude=float(atr["lon"])
+        )
 
-    @property
-    def id(self) -> int:
-        return int(self.attrib["id"])
-
-    @property
-    def name(self) -> str:
-        return self.attrib["name"]
-
-    @property
-    def url(self) -> str:
-        return self.attrib["url"]
-
-    @property
-    def host(self) -> str:
-        return self.attrib["host"]
-
-    @property
-    def country(self) -> str:
-        return self.attrib["country"]
-
-    @property
-    def country_code(self) -> str:
-        return self.attrib["cc"]
-
-    @property
-    def sponsor(self) -> str:
-        return self.attrib["sponsor"]
-
-    @property
-    def latitude(self) -> float:
-        return float(self.attrib["lat"])
-
-    @property
-    def longitude(self) -> float:
-        return float(self.attrib["lon"])
+    def __hash__(self) -> int:
+        return self.id
 
     @property
     def lat_lon(self) -> Tuple[float, float]:
@@ -69,8 +58,7 @@ class SpeedtestServer:
 
         :return: Distance in kilometers.
         """
-        self.attrib["d"] = speedtest.distance(self.lat_lon, lat_lon)
-        return self.attrib["d"]
+        return speedtest.distance(self.lat_lon, lat_lon)
 
     def speedtest_server(self, st: speedtest.Speedtest) -> Tuple[float, Dict[str, Any]]:
         """
@@ -81,7 +69,8 @@ class SpeedtestServer:
         :return: Key and value, ready to be appended to the speedtest.Speedtest().servers dictionary.
         """
         d = self.distance_to(st.lat_lon)
-        return d, self.attrib
+        self.xml_attrib["d"] = d
+        return d, self.xml_attrib
 
 
 def get_servers(*,
@@ -91,11 +80,28 @@ def get_servers(*,
                 hosts: Optional[Sequence[str]] = None,
                 host_contains: Optional[Sequence[str]] = None,
                 sponsors: Optional[Sequence[str]] = None,
-                from_cache: bool = False, cache_servers: bool = True) -> Optional[List[SpeedtestServer]]:
+                from_cache: bool = False, cache_servers: bool = True,
+                cache_file: str = "cache/servers.xml") -> Optional[List[SpeedtestServer]]:
+    """
+    Get list of available SpeedTest server.
+
+    :param countries:     If provided, only servers from this countries will be listed.
+    :param country_codes: If provided, only servers with such country codes will be listed.
+    :param names:         If provided, only servers matching any of the provided names will be listed.
+    :param hosts:         If provided, only servers matching any of the provided hosts will be listed.
+    :param host_contains: If provided, only servers of which host contains any of the provided strings will be listed.
+    :param sponsors:      If provided, only servers of which sponsor match any of the provided sponsors will be listed.
+
+    :param from_cache:    Whether to use the cache file for server information instead
+                          of fetching the list from the SpeedTest website.
+    :param cache_servers: Whether to save the fetched server list to local cache file.
+    :param cache_file:    Path to local cache file.
+
+    :return: List of server or None if cache didn't exist and server list could not be fetched from the internet.
+    """
     import os
 
-    cache_file = "cache/servers.xml"
-
+    # Get list of the servers from cache or via web request
     if from_cache and os.path.isfile(cache_file):
         with open(cache_file, 'rb') as f:
             servers_xml = f.read().decode()
@@ -111,17 +117,19 @@ def get_servers(*,
                 with open(cache_file, 'wb') as f:
                     f.write(servers_xml.encode())
         else:
-            print(resp.status_code, resp.reason)
+            print(resp.status_code, resp.reason, file=sys.stderr)
             servers_xml = None
+
+    # Parse list of server
     if servers_xml:
         try:
             xml_tree: ElementTree.Element = ElementTree.fromstringlist(servers_xml)
             # Parse all servers
-            servers: List[SpeedtestServer] = []
-            for srv in xml_tree[0]:  # type: ElementTree.Element
-                servers.append(SpeedtestServer(srv))
+            servers: List[SpeedtestServer] = [
+                SpeedtestServer.from_xml(srv) for srv in xml_tree[0]
+            ]
         except ElementTree.ParseError as e:
-            warnings.warn(e)
+            print(e, file=sys.stderr)
             servers = None
     else:
         servers = None
@@ -165,15 +173,16 @@ def speedtest_servers(st: Optional[speedtest.Speedtest] = None, servers: Optiona
     all_servers = list(itertools.chain.from_iterable(st.servers.values()))
     results = []
     for server in all_servers:
-        print("Testing server {}".format(server))
+        print(f"{datetime.datetime.now()}: Testing server {server}")
         start_time = time.perf_counter()
-        st.best = server
+        # Set this server as the best server as only this server is tested.
+        st._best = server
         # Test speeds
         st.download()
         st.upload()
         st.results.server = server
         results.append(st.results)
-        print("Done in {:.3f} s: {}".format(time.perf_counter() - start_time, st.results.dict()))
+        print(f"{datetime.datetime.now()}: Done in {time.perf_counter() - start_time:.3f} s: {st.results.dict()}")
 
     return results
 
@@ -184,17 +193,22 @@ def main():
     for server in custom_servers:
         print(" - {}".format(server))
 
+    # Create the file
     out_file = "results.csv"
-    with open(out_file, "a"):
+    with open(out_file, 'a'):
         pass
 
     while True:
+        print(f"{datetime.datetime.now()}: Testing {len(custom_servers)} servers...")
+        start_time = time.perf_counter()
+
         results = speedtest_servers(servers=custom_servers)
 
-        print("Saving results to {}".format(out_file))
-        with open(out_file, "a") as f:
+        print(f"Saving results to '{out_file}'")
+        with open(out_file, 'a') as f:
             f.writelines(str(result.dict()) + "\n" for result in results)
 
+        print(f"{datetime.datetime.now()}: {len(custom_servers)} tested in {time.perf_counter() - start_time:.3f} s")
         time.sleep(5 * 60)
 
 
