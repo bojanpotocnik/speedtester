@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field, fields, asdict
 from typing import List, Optional, Sequence, Dict, Tuple, Any, Union, Iterator
@@ -300,14 +301,9 @@ class SpeedtestResult:
             return cls.from_json(result, iteration, start_time, end_time)
 
 
-iteration = 0
-
-
-def speedtest_servers(st: Optional[speedtest.Speedtest] = None, servers: Optional[Sequence[SpeedtestServer]] = None) \
+def speedtest_servers(st: Optional[speedtest.Speedtest], servers: Optional[Sequence[SpeedtestServer]], iteration: int) \
         -> Iterator[Tuple[speedtest.Speedtest, SpeedtestResult]]:
     """Test multiple servers."""
-    global iteration
-
     if not st:
         st = speedtest.Speedtest()
     if servers:
@@ -339,8 +335,6 @@ def speedtest_servers(st: Optional[speedtest.Speedtest] = None, servers: Optiona
         print(f"{datetime.datetime.now()}: Done in {time.perf_counter() - start_time:.3f} s: {result}")
 
         yield st, result
-
-    iteration += 1
 
 
 # region Data logging
@@ -390,27 +384,57 @@ class File:
 # endregion Data logging
 
 
-def main() -> None:
-    custom_servers = get_servers(countries=("Slovenia",), names=("Ljubljana",), from_cache=True)
-    print(f"Testing to {len(custom_servers)} servers:")
-    for server in custom_servers:
-        print(" - {}".format(server))
+def main(interval: int = 5) -> None:
+    """
+    :param interval: Measurement repeat interval (minutes). Multiple servers will be evenly time-split so that
+                     each server has this constant interval.
+    """
+    servers = get_servers(countries=("Slovenia",), names=("Ljubljana",), from_cache=True)
+    print(f"Testing to {len(servers)} servers every {interval} minutes:")
+    for srv in servers:
+        print(f" - {srv}")
+    interval_offset = 60 if (len(servers) <= interval) else interval * 60 / len(servers)
 
     file = File()
-    st = None  # Speedtest instance will be reused.
-    while True:
-        print(f"{datetime.datetime.now()}: Testing {len(custom_servers)} servers...")
-        start_time = time.perf_counter()
-        next_timestamp = datetime.datetime.now() + datetime.timedelta(minutes=5)
+    st: speedtest.Speedtest = None  # Speedtest instance will be reused.
 
-        for st, result in speedtest_servers(st, servers=custom_servers):
-            file.write(result)
+    for iteration in itertools.count():
+        print(f"{iteration}. {datetime.datetime.now()}: Testing {len(servers)} servers...")
 
-        print(f"{datetime.datetime.now()}: {len(custom_servers)} tested in {time.perf_counter() - start_time:.3f} s")
+        ts_start = datetime.datetime.now()
+        # Round up to next minute, but do not ignore this time for interval
+        ts_next = (ts_start.replace(microsecond=0)
+                   + datetime.timedelta(minutes=interval)
+                   - datetime.timedelta(seconds=60 - ts_start.second + 5))  # TODO: Problem if the second is 0.
+        ts_start = ts_start.replace(second=0, microsecond=0) + datetime.timedelta(minutes=1)
+        # Calculate in-interval time offset for each server
+        ts_offsets = {
+            ts_start + datetime.timedelta(seconds=i * interval_offset): srv for i, srv in enumerate(servers)
+        }
 
-        print(f"Waiting for {(next_timestamp - datetime.datetime.now()).total_seconds()} seconds...")
-        while datetime.datetime.now() < next_timestamp:
-            time.sleep(0.5)
+        while ts_offsets:
+            result = None
+            for ts, srv in ts_offsets.items():
+                if datetime.datetime.now() >= ts:
+                    st, result = next(speedtest_servers(st, servers=[srv], iteration=iteration))
+                    file.write(result)
+                    # This timestamp/server must was tested and must not be checked again.
+                    del ts_offsets[ts]
+                    break  # Iteration cannot continue as dictionary was modified while iterating.
+            if not result:
+                # Nothing was done, don't consume CPU.
+                time.sleep(0.1)
+
+        print(f"{iteration}. {datetime.datetime.now()}: {len(servers)}"
+              f" tested in {(datetime.datetime.now() - ts_start).total_seconds():.3f} s")
+
+        wait_time = (ts_next - datetime.datetime.now()).total_seconds()
+        if wait_time <= 0:
+            warnings.warn(f"Interval of {interval} minutes is {-wait_time} s too short for all the servers!")
+        else:
+            print(f"Waiting for {wait_time} seconds...")
+            while datetime.datetime.now() < ts_next:
+                time.sleep(0.5)
 
 
 def test_servers() -> None:
