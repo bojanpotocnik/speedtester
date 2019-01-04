@@ -1,16 +1,21 @@
 import datetime
 import itertools
+import json
+import os
 import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Dict, Tuple, Any, Union
+from dataclasses import dataclass, field, fields, asdict
+from typing import List, Optional, Sequence, Dict, Tuple, Any, Union, Iterator
 from xml.etree import ElementTree
 
+import dateutil.parser
 import speedtest
 
 __author__ = "Bojan Potočnik"
 
+
+# region Speedtest servers
 
 @dataclass(frozen=True)
 class SpeedtestServer:
@@ -155,8 +160,154 @@ def get_servers(*,
     return servers
 
 
+# endregion Speedtest servers
+
+
+@dataclass
+class SpeedtestResult:
+    @dataclass
+    class Server:
+        id: int
+        name: str
+        url: str
+        url2: Optional[str]
+        host: str
+        country: str
+        country_code: str
+        sponsor: str
+        latitude: float
+        longitude: float
+        distance: float
+
+        # noinspection SpellCheckingInspection
+        @classmethod
+        def new(cls, jsn: Dict[str, Any]) -> 'SpeedtestResult.Server':
+            return cls(
+                id=int(jsn["id"]),
+                name=jsn["name"],
+                url=jsn["url"],
+                url2=jsn.get("url", None),
+                host=jsn["host"],
+                country=jsn["country"],
+                country_code=jsn["cc"],
+                sponsor=jsn["sponsor"],
+                latitude=float(jsn["lat"]),
+                longitude=float(jsn["lon"]),
+                distance=float(jsn["d"])
+            )
+
+    @dataclass
+    class Client:
+        ip: str
+        latitude: float
+        longitude: float
+        country_code: str
+        isp: str
+        isp_rating: float
+        isp_download_average: float
+        isp_upload_average: float
+        rating: float
+        logged_in: bool  # True type yet unknown.
+
+        # noinspection SpellCheckingInspection
+        @classmethod
+        def new(cls, jsn: Dict[str, Any]) -> 'SpeedtestResult.Client':
+            # This variable is extracted here because the true "True" type hasn't been observed yet.
+            if jsn["loggedin"] == "0":
+                logged_in = False
+            elif jsn["loggedin"] == "1":
+                logged_in = True
+            else:
+                logged_in = jsn["loggedin"]
+
+            return cls(
+                ip=jsn["ip"],
+                latitude=float(jsn["lat"]),
+                longitude=float(jsn["lon"]),
+                country_code=jsn["country"],
+                isp=jsn["isp"],
+                isp_rating=float(jsn["isprating"]),
+                isp_download_average=float(jsn["ispdlavg"]),
+                isp_upload_average=float(jsn["ispulavg"]),
+                rating=float(jsn["rating"]),
+                logged_in=logged_in,
+            )
+
+    # region Local test parameters
+    iteration: int
+    start_time: datetime.datetime
+    end_time: datetime.datetime
+    # endregion Local test parameters
+    # region Speedtest results
+    timestamp: datetime.datetime
+    bytes_sent: int
+    bytes_received: int
+    share: Optional[str]  # This requires additional POST to generate PNG image.
+    ping: int
+    download: float
+    upload: float
+    server: Server
+    client: Client
+
+    # endregion Speedtest results
+
+    @classmethod
+    def from_json(cls, jsn: Union[str, Dict[str, Any]], iteration: int,
+                  start_time: datetime.datetime, end_time: datetime.datetime = None) -> 'SpeedtestResult':
+        if isinstance(jsn, str):
+            jsn = json.loads(jsn)
+
+        return cls(
+            iteration=iteration,
+            start_time=start_time.astimezone(),
+            end_time=end_time.astimezone() if end_time else datetime.datetime.now().astimezone(),
+            timestamp=dateutil.parser.parse(jsn["timestamp"]).astimezone(),
+            bytes_sent=int(jsn["bytes_sent"]),
+            bytes_received=int(jsn["bytes_received"]),
+            share=jsn["share"],
+            ping=int(jsn["ping"]),
+            download=float(jsn["download"]),
+            upload=float(jsn["upload"]),
+            server=cls.Server.new(jsn["server"]) if jsn["server"] else None,
+            client=cls.Client.new(jsn["client"]) if jsn["client"] else None,
+        )
+
+    @classmethod
+    def from_result(cls, result: speedtest.SpeedtestResults, iteration: int,
+                    start_time: datetime.datetime, end_time: datetime.datetime = None) -> 'SpeedtestResult':
+        # noinspection PyProtectedMember
+        return cls(
+            iteration=iteration,
+            start_time=start_time.astimezone(),
+            end_time=end_time.astimezone() if end_time else datetime.datetime.now().astimezone(),
+            timestamp=dateutil.parser.parse(result.timestamp).astimezone(),
+            bytes_sent=result.bytes_sent,
+            bytes_received=result.bytes_received,
+            share=result._share,
+            ping=result.ping,
+            download=result.download,
+            upload=result.upload,
+            server=cls.Server.new(result.server) if result.server else None,
+            client=cls.Client.new(result.client) if result.client else None,
+        )
+
+    @classmethod
+    def new(cls, result: Union[str, Dict[str, Any], speedtest.SpeedtestResults], iteration: int,
+            start_time: datetime.datetime, end_time: datetime.datetime = None) -> 'SpeedtestResult':
+        if isinstance(result, speedtest.SpeedtestResults):
+            return cls.from_result(result, iteration, start_time, end_time)
+        else:
+            return cls.from_json(result, iteration, start_time, end_time)
+
+
+iteration = 0
+
+
 def speedtest_servers(st: Optional[speedtest.Speedtest] = None, servers: Optional[Sequence[SpeedtestServer]] = None) \
-        -> List[speedtest.SpeedtestResults]:
+        -> Iterator[Tuple[speedtest.Speedtest, SpeedtestResult]]:
+    """Test multiple servers."""
+    global iteration
+
     if not st:
         st = speedtest.Speedtest()
     if servers:
@@ -171,48 +322,98 @@ def speedtest_servers(st: Optional[speedtest.Speedtest] = None, servers: Optiona
         st.servers = st.best  # FIXME
     # Test to all servers.
     all_servers = list(itertools.chain.from_iterable(st.servers.values()))
-    results = []
     for server in all_servers:
         print(f"{datetime.datetime.now()}: Testing server {server}")
         start_time = time.perf_counter()
+        start_timestamp = datetime.datetime.now()
         # Set this server as the best server as only this server is tested.
         st._best = server
         # Test speeds
         st.download()
         st.upload()
+        end_timestamp = datetime.datetime.now()
+        # Add information which is otherwise added in the library test function.
         st.results.server = server
-        results.append(st.results)
-        print(f"{datetime.datetime.now()}: Done in {time.perf_counter() - start_time:.3f} s: {st.results.dict()}")
 
-    return results
+        result = SpeedtestResult.new(st.results, iteration, start_timestamp, end_timestamp)
+        print(f"{datetime.datetime.now()}: Done in {time.perf_counter() - start_time:.3f} s: {result}")
+
+        yield st, result
+
+    iteration += 1
 
 
-def main():
+# region Data logging
+
+class File:
+
+    def __init__(self, path: str = "results.csv") -> None:
+        if not os.path.isabs(path):
+            path = os.path.join(os.path.dirname(__file__), path)
+        path = os.path.abspath(path)
+
+        if not os.path.isfile(path):
+            headers = []
+            for f in fields(SpeedtestResult):
+                if f.name in ("server", "client"):
+                    headers.extend(f"{f.name}_{fc.name}" for fc in fields(f.type))
+                else:
+                    headers.append(f.name)
+
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w') as f:
+                print(",".join(headers), end="", flush=True, file=f)
+
+        self.path = path
+
+    def write(self, result: SpeedtestResult) -> None:
+        values = []
+        for field_name, field_value in asdict(result).items():
+            if field_name in ("server", "client"):
+                values.extend(fc_value for fc_value in asdict(getattr(result, field_name)).values())
+            else:
+                values.append(field_value)
+        # Convert values to str
+        for i, v in enumerate(values):
+            if isinstance(v, str):
+                values[i] = f'"{v}"'
+            elif isinstance(v, datetime.datetime):
+                values[i] = v.isoformat()
+            else:
+                values[i] = str(v)
+        # Append row to file
+        with open(self.path, 'a') as f:
+            print(file=f)
+            print(",".join(values), end="", flush=True, file=f)
+
+
+# endregion Data logging
+
+
+def main() -> None:
     custom_servers = get_servers(countries=("Slovenia",), names=("Ljubljana",), from_cache=True)
-    print("Testing to servers:")
+    print(f"Testing to {len(custom_servers)} servers:")
     for server in custom_servers:
         print(" - {}".format(server))
 
-    # Create the file
-    out_file = "results.csv"
-    with open(out_file, 'a'):
-        pass
-
+    file = File()
+    st = None  # Speedtest instance will be reused.
     while True:
         print(f"{datetime.datetime.now()}: Testing {len(custom_servers)} servers...")
         start_time = time.perf_counter()
+        next_timestamp = datetime.datetime.now() + datetime.timedelta(minutes=5)
 
-        results = speedtest_servers(servers=custom_servers)
-
-        print(f"Saving results to '{out_file}'")
-        with open(out_file, 'a') as f:
-            f.writelines(str(result.dict()) + "\n" for result in results)
+        for st, result in speedtest_servers(st, servers=custom_servers):
+            file.write(result)
 
         print(f"{datetime.datetime.now()}: {len(custom_servers)} tested in {time.perf_counter() - start_time:.3f} s")
-        time.sleep(5 * 60)
+
+        print(f"Waiting for {(next_timestamp - datetime.datetime.now()).total_seconds()} seconds...")
+        while datetime.datetime.now() < next_timestamp:
+            time.sleep(0.5)
 
 
-def test():
+def test_servers() -> None:
     s = speedtest.Speedtest()
     s.get_servers()
     best_server = s.get_best_server()
@@ -226,6 +427,51 @@ def test():
     print(s.results.csv())
 
 
+def test_csv() -> None:
+    file = File()
+
+    for i in range(10):
+        now = datetime.datetime.now()
+        # noinspection PyCallByClass
+        result = SpeedtestResult(iteration=i,
+                                 start_time=now,
+                                 end_time=now + datetime.timedelta(seconds=23),
+                                 timestamp=now + datetime.timedelta(seconds=1),
+                                 bytes_sent=256,
+                                 bytes_received=1024,
+                                 share=None,
+                                 ping=20 + i,
+                                 download=11.2, upload=3.8,
+                                 server=SpeedtestResult.Server(
+                                     id=i,
+                                     name="name!",
+                                     url="url!",
+                                     url2="url2!",
+                                     host="host!",
+                                     country="country!",
+                                     country_code="country_code!",
+                                     sponsor="sponsor!",
+                                     latitude=11.22,
+                                     longitude=33.4,
+                                     distance=0.5678
+                                 ),
+                                 client=SpeedtestResult.Client(
+                                     ip=f"192.168.1.{i}",
+                                     latitude=12.34,
+                                     longitude=56.78,
+                                     country_code="CC",
+                                     isp="ISP!",
+                                     isp_rating=3.7,
+                                     isp_download_average=9.8,
+                                     isp_upload_average=2.1,
+                                     rating=1.1,
+                                     logged_in=False
+                                 ))
+        file.write(result)
+        time.sleep(0.2)
+
+
 if __name__ == "__main__":
-    # test()
+    # test_servers()
+    # test_csv()
     main()
